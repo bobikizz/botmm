@@ -4,7 +4,6 @@ import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# Импорты MoviePy 2.x
 from moviepy import VideoFileClip
 import moviepy.video.fx as fx
 
@@ -13,16 +12,20 @@ logger = logging.getLogger(__name__)
 
 TOKEN = ''
 
-# Настройки по умолчанию
+MAX_SIZE_BYTES = 20 * 1024 * 1024
+
 DEFAULT_SETTINGS = {
     'speed': 1.0,
     'fps': 10,
     'width': 480,
-    'start_time': 0,
-    'awaiting_input': None  # Флаг: какой параметр ждем от пользователя
+    'start_time': 0.0,
+    'end_time': None, # None означает до конца видео
+    'awaiting_input': None,
+    'last_msg_id': None # Для предотвращения лагов клавиатуры
 }
 
 def get_settings_keyboard(settings):
+    end_text = f"{settings['end_time']}с" if settings['end_time'] is not None else "До конца"
     keyboard = [
         [
             InlineKeyboardButton(f"Скорость: {settings['speed']}x", callback_data="edit_speed"),
@@ -32,12 +35,15 @@ def get_settings_keyboard(settings):
             InlineKeyboardButton(f"Ширина: {settings['width']}px", callback_data="edit_width"),
             InlineKeyboardButton(f"Старт: {settings['start_time']}с", callback_data="edit_start")
         ],
-        [InlineKeyboardButton("🚀 СОЗДАТЬ GIF", callback_data="start_conversion")]
+        [
+            InlineKeyboardButton(f"Конец: {end_text}", callback_data="edit_end"),
+            InlineKeyboardButton("🚀 СОЗДАТЬ GIF", callback_data="start_conversion")
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отправь видео, а затем укажи настройки кнопками или текстом.")
+    await update.message.reply_text("Здравствуйте. Отправьте мне видео, и я отправлю вам GIF!")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video = update.message.video
@@ -46,15 +52,21 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['settings'] = DEFAULT_SETTINGS.copy()
     input_path = f"video_{user_id}.mp4"
     
-    status_msg = await update.message.reply_text("Скачиваю видео...")
+    status_msg = await update.message.reply_text("📥 Скачиваю...")
     file = await video.get_file()
     await file.download_to_drive(input_path)
     
+    # Узнаем длительность видео
+    with VideoFileClip(input_path) as clip:
+        duration = clip.duration
+        context.user_data['settings']['video_duration'] = duration
+
     await status_msg.delete()
-    await update.message.reply_text(
-        "Нажми на кнопку, чтобы изменить параметр текстом:",
+    msg = await update.message.reply_text(
+        f"Видео получено (длительность: {duration:.1f}с).\nНастройте параметры:",
         reply_markup=get_settings_keyboard(context.user_data['settings'])
     )
+    context.user_data['settings']['last_msg_id'] = msg.message_id
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -62,89 +74,100 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = context.user_data.get('settings')
 
     if not settings:
-        await query.answer("Сессия истекла.")
+        await query.answer("Сессия истекла, отправьте видео снова.")
         return
 
     if data.startswith("edit_"):
         param = data.split("_")[1]
         settings['awaiting_input'] = param
-        await query.message.reply_text(f"Введите новое значение для: {param}")
+        await query.message.reply_text(f"Введите значение для {param} (число):")
         await query.answer()
     
     elif data == "start_conversion":
-        settings['awaiting_input'] = None
-        await query.edit_message_text("⏳ Начинаю конвертацию...")
+        await query.edit_message_text("⏳ Обработка... Если файл большой, я попробую его сжать.")
         await convert_and_send_gif(update, context)
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстового ввода параметров"""
     settings = context.user_data.get('settings')
-    
     if not settings or not settings.get('awaiting_input'):
-        return # Если мы ничего не ждем, игнорируем текст
+        return
 
     param = settings['awaiting_input']
     text = update.message.text
     
     try:
-        # Простая валидация чисел
-        value = float(text) if param in ['speed', 'start_time'] else int(text)
-        settings[param] = value
-        settings['awaiting_input'] = None # Сбрасываем ожидание
+        val = float(text)
+        if param in ['fps', 'width']: val = int(val)
         
-        await update.message.reply_text(
-            f"✅ Параметр {param} изменен на {value}",
+        settings[param] = val
+        settings['awaiting_input'] = None
+        
+        # Чтобы клавиатура "не лагала", удаляем старое текстовое сообщение и обновляем главное
+        try: await update.message.delete()
+        except: pass
+
+        await context.bot.edit_message_reply_markup(
+            chat_id=update.effective_chat.id,
+            message_id=settings['last_msg_id'],
             reply_markup=get_settings_keyboard(settings)
         )
-    except ValueError:
-        await update.message.reply_text("Ошибка! Введите число (например: 1.5 или 15).")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка ввода. Введите только число.")
 
 async def convert_and_send_gif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     input_path = f"video_{user_id}.mp4"
     output_path = f"output_{user_id}.gif"
-    settings = context.user_data.get('settings', DEFAULT_SETTINGS)
+    settings = context.user_data.get('settings')
+    
+    curr_width = settings['width']
+    curr_fps = settings['fps']
     
     try:
-        with VideoFileClip(input_path) as clip:
-            # Обрезка
-            start_t = min(max(0, settings['start_time']), clip.duration - 0.5)
-            new_clip = clip.subclipped(start_t, clip.duration) if hasattr(clip, 'subclipped') else clip.subclip(start_t, clip.duration)
-            
-            # Скорость
-            if settings['speed'] != 1.0:
-                new_clip = new_clip.with_effects([fx.MultiplySpeed(settings['speed'])]) if hasattr(fx, 'MultiplySpeed') else new_clip.speedx(settings['speed'])
+        for attempt in range(3):
+            with VideoFileClip(input_path) as clip:
+                # Настройка начала и конца
+                start_t = max(0, settings['start_time'])
+                end_t = settings['end_time'] if settings['end_time'] else clip.duration
+                if end_t <= start_t: end_t = clip.duration
+                
+                new_clip = clip.subclip(start_t, end_t)
+                
+                # Скорость
+                if settings['speed'] != 1.0:
+                    new_clip = new_clip.speedx(settings['speed'])
 
-            # Размер
-            final_clip = new_clip.resized(width=settings['width']) if hasattr(new_clip, 'resized') else new_clip.resize(width=settings['width'])
-            
-            final_clip.write_gif(output_path, fps=settings['fps'], logger=None)
-            final_clip.close()
+                # Размер
+                final_clip = new_clip.resize(width=curr_width)
+                final_clip.write_gif(output_path, fps=curr_fps, logger=None)
+                final_clip.close()
 
-        with open(output_path, 'rb') as gif_file:
-            await context.bot.send_animation(chat_id=update.effective_chat.id, animation=gif_file, write_timeout=300)
-        
+            if os.path.getsize(output_path) <= MAX_SIZE_BYTES:
+                break
+            
+            # Сжатие если > 20МБ
+            curr_width = int(curr_width * 0.7)
+            curr_fps = max(5, curr_fps - 2)
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Сжимаю сильнее (попытка {attempt+2})...")
+
+        with open(output_path, 'rb') as f:
+            await context.bot.send_animation(chat_id=update.effective_chat.id, animation=f)
+            
     except Exception as e:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Ошибка: {e}")
     finally:
-        await asyncio.sleep(1.5)
-        for path in [input_path, output_path]:
-            if os.path.exists(path):
-                try: os.remove(path)
-                except: pass
+        await asyncio.sleep(1)
+        for p in [input_path, output_path]:
+            if os.path.exists(p): os.remove(p)
         context.user_data.clear()
 
 def main():
-    application = Application.builder().token(TOKEN).read_timeout(600).write_timeout(600).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    # Хендлер для текстовых сообщений (настроек)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
-
-    print("Бот запущен...")
-    application.run_polling()
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
