@@ -1,6 +1,9 @@
 # botmm
 Бот, чтобы из видео получить гифку
-<img width="870" height="743" alt="diagram (3)" src="https://github.com/user-attachments/assets/6c199f6c-b95a-4fd2-a16e-ec06499bd058" />
+<img width="870" height="743" alt="diagram" src="https://github.com/user-attachments/assets/b12b28eb-0b97-4055-a472-901513806ca3" />
 
 
-Бот будет работать через библиотеки moviepy и python-telegram-bot
+В боте есть гибкие настройки в виде изменения скорости, FPS, размера (ширины) и обрезки по времени
+Бот работает через библиотеки moviepy и python-telegram-bot
+Чтобы его запустить нужно вставить свой токен от @BotFather в переменную TOKEN
+Если итоговая GIF превышает 10 МБ, то бот снизит её качество
